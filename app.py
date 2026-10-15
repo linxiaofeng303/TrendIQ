@@ -6,6 +6,9 @@ import yfinance as yf
 import os
 import json
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
 
 # Conditionally import TensorFlow (to allow deployment on Vercel where TF is omitted)
@@ -16,6 +19,75 @@ except ImportError:
     HAS_TENSORFLOW = False
 
 app = Flask(__name__, template_folder="frontend", static_folder="frontend")
+
+def mt5_bridge_configured():
+    return bool(os.getenv("MT5_BRIDGE_URL", "").strip())
+
+def mt5_bridge_request(endpoint, params=None):
+    """Call the separately hosted MT5 bridge without exposing broker credentials."""
+    base_url = os.getenv("MT5_BRIDGE_URL", "").strip().rstrip("/")
+    token = os.getenv("MT5_BRIDGE_TOKEN", "").strip()
+    if not base_url:
+        raise RuntimeError("MT5 data bridge is not configured.")
+    if not token:
+        raise RuntimeError("MT5_BRIDGE_TOKEN is missing from the website environment.")
+
+    query = urllib.parse.urlencode(params or {})
+    url = f"{base_url}/api/{endpoint}"
+    if query:
+        url = f"{url}?{query}"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        raise RuntimeError(f"MT5 bridge returned HTTP {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Could not reach the MT5 data bridge: {exc}") from exc
+
+    if isinstance(payload, dict) and payload.get("error"):
+        raise RuntimeError(payload["error"])
+    return payload
+
+def fetch_mt5_gold_history(ticker_symbol):
+    """Fetch daily broker candles for the website's XAUUSD alias."""
+    if ticker_symbol.upper() not in {"XAUUSD", "GOLD"} or not mt5_bridge_configured():
+        return None
+
+    symbol = os.getenv("MT5_GOLD_SYMBOL", "GOLD").strip() or "GOLD"
+    payload = mt5_bridge_request(
+        "history", {"symbol": symbol, "timeframe": "D1", "count": 1000}
+    )
+    rates = payload.get("rates", []) if isinstance(payload, dict) else []
+    if not rates:
+        raise RuntimeError(f"MT5 returned no daily history for {symbol}.")
+
+    hist_data = pd.DataFrame(rates)
+    if "time" not in hist_data or "close" not in hist_data:
+        raise RuntimeError("MT5 bridge returned rates in an unexpected format.")
+    hist_data.index = pd.to_datetime(hist_data.pop("time"), unit="s", utc=True)
+    hist_data["Close"] = pd.to_numeric(hist_data["close"], errors="coerce")
+    return hist_data
+
+def fetch_mt5_gold_quote():
+    if not mt5_bridge_configured():
+        return None
+    symbol = os.getenv("MT5_GOLD_SYMBOL", "GOLD").strip() or "GOLD"
+    payload = mt5_bridge_request("quote", {"symbol": symbol})
+    price = payload.get("price") if isinstance(payload, dict) else None
+    if price is None:
+        raise RuntimeError(f"MT5 bridge returned no current quote for {symbol}.")
+    return {
+        "symbol": "XAUUSD",
+        "price": round(float(price), 2),
+        "change": round(float(payload.get("change", 0)), 2),
+        "changePercent": round(float(payload.get("changePercent", 0)), 2),
+    }
 
 # ==============================================================================
 # Financial Sentiment Lexicon & Analyzer
@@ -204,6 +276,18 @@ def live_ticker():
                 'change': None,
                 'changePercent': None
             })
+
+    if mt5_bridge_configured():
+        try:
+            ticker_data.append(fetch_mt5_gold_quote())
+        except Exception as e:
+            print(f"Error fetching XM GOLD quote: {e}")
+            ticker_data.append({
+                'symbol': 'XAUUSD',
+                'price': None,
+                'change': None,
+                'changePercent': None
+            })
             
     return jsonify(ticker_data)
 
@@ -214,14 +298,17 @@ def predict_multi_horizon(ticker):
     """
     from sklearn.linear_model import Ridge
     
-    # 1. Fetch 2 years of daily data for statistical stability
-    stock = yf.Ticker(ticker)
-    hist_data = stock.history(period="2y")
-    
-    if hist_data.empty or len(hist_data) < 40:
-        hist_data = stock.history(period="3y")
+    # Use the user's XM MT5 feed for gold when a bridge is configured.
+    # Other symbols keep using Yahoo Finance as before.
+    hist_data = fetch_mt5_gold_history(ticker)
+    if hist_data is None:
+        stock = yf.Ticker(ticker)
+        hist_data = stock.history(period="2y")
+
         if hist_data.empty or len(hist_data) < 40:
-            raise ValueError(f"Insufficient historical data available for {ticker}.")
+            hist_data = stock.history(period="3y")
+            if hist_data.empty or len(hist_data) < 40:
+                raise ValueError(f"Insufficient historical data available for {ticker}.")
             
     hist_data = hist_data.dropna(subset=['Close'])
     prices = hist_data['Close'].values

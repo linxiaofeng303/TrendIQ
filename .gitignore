@@ -23,6 +23,7 @@ MANIFEST
 
 # Virtual Environment
 venv/
+.venv-mt5/
 env/
 ENV/
 env.bak/
