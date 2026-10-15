@@ -298,8 +298,16 @@ def predict_multi_horizon(ticker):
     """
     from sklearn.linear_model import Ridge
     
-    # Use the user's XM MT5 feed for gold when a bridge is configured.
-    # Other symbols keep using Yahoo Finance as before.
+    # Gold must come from the user's XM MT5 feed. Never silently fall back to
+    # Yahoo Finance for XAUUSD/GOLD, where a different instrument/scale could
+    # otherwise produce a plausible-looking but incorrect forecast.
+    is_gold = ticker.upper() in {"XAUUSD", "GOLD"}
+    if is_gold and not mt5_bridge_configured():
+        raise RuntimeError(
+            "The XM MT5 gold feed is not configured for this deployment. "
+            "Set MT5_BRIDGE_URL, MT5_BRIDGE_TOKEN, and MT5_GOLD_SYMBOL."
+        )
+
     hist_data = fetch_mt5_gold_history(ticker)
     if hist_data is None:
         stock = yf.Ticker(ticker)
